@@ -1,0 +1,1455 @@
+<script setup lang="ts">
+/**
+ * DiagramCanvas - Vue Flow wrapper for MindGraph diagrams
+ * Provides unified interface for all diagram types with drag-drop, zoom, and pan
+ *
+ * Two-View Zoom System:
+ * - fitToFullCanvas(): Fits diagram to full canvas (no panel space reserved)
+ * - fitWithPanel(): Fits diagram with space reserved for right-side panels
+ * - Automatically re-fits when panels open/close
+ */
+import { computed, markRaw, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+
+import { Background } from '@vue-flow/background'
+import { VueFlow, useVueFlow } from '@vue-flow/core'
+import { MiniMap } from '@vue-flow/minimap'
+
+import { eventBus } from '@/composables/useEventBus'
+import { getDefaultDiagramName, useDiagramExport, useLanguage } from '@/composables'
+import { useTheme } from '@/composables/useTheme'
+import { ANIMATION, FIT_PADDING, GRID, PANEL, ZOOM } from '@/config/uiConfig'
+import { DEFAULT_CENTER_X, DEFAULT_CENTER_Y } from '@/composables/diagrams/layoutConfig'
+import { useDiagramStore, usePanelsStore, useUIStore } from '@/stores'
+import type { CircleMapLayoutResult } from '@/stores/specLoader/utils'
+import { recalculateBubbleMapLayout } from '@/stores/specLoader'
+import { calculateCircleMapLayout } from '@/stores/specLoader/utils'
+import type { MindGraphNode } from '@/types'
+
+import BraceOverlay from './BraceOverlay.vue'
+import BridgeOverlay from './BridgeOverlay.vue'
+import ContextMenu from './ContextMenu.vue'
+import BraceEdge from './edges/BraceEdge.vue'
+// Import custom edge components
+import CurvedEdge from './edges/CurvedEdge.vue'
+import HorizontalStepEdge from './edges/HorizontalStepEdge.vue'
+import RadialEdge from './edges/RadialEdge.vue'
+import StepEdge from './edges/StepEdge.vue'
+import StraightEdge from './edges/StraightEdge.vue'
+import TreeEdge from './edges/TreeEdge.vue'
+import BoundaryNode from './nodes/BoundaryNode.vue'
+import BraceNode from './nodes/BraceNode.vue'
+import BranchNode from './nodes/BranchNode.vue'
+import BubbleNode from './nodes/BubbleNode.vue'
+import CircleNode from './nodes/CircleNode.vue'
+import FlowNode from './nodes/FlowNode.vue'
+import FlowSubstepNode from './nodes/FlowSubstepNode.vue'
+import LabelNode from './nodes/LabelNode.vue'
+// Import custom node components
+import TopicNode from './nodes/TopicNode.vue'
+
+// Props
+interface Props {
+  showBackground?: boolean
+  showMinimap?: boolean
+  fitViewOnInit?: boolean
+  /** When true, left-click drag pans canvas; nodes are not draggable */
+  handToolActive?: boolean
+}
+
+const props = withDefaults(defineProps<Props>(), {
+  showBackground: true,
+  showMinimap: false,
+  fitViewOnInit: true,
+  handToolActive: false,
+})
+
+// Emits
+const emit = defineEmits<{
+  (e: 'nodeClick', node: MindGraphNode): void
+  (e: 'nodeDoubleClick', node: MindGraphNode): void
+  (e: 'nodeDragStop', node: MindGraphNode): void
+  (e: 'selectionChange', nodes: MindGraphNode[]): void
+  (e: 'paneClick'): void
+}>()
+
+// Stores
+const diagramStore = useDiagramStore()
+const panelsStore = usePanelsStore()
+const uiStore = useUIStore()
+
+// Theme for background color
+const { backgroundColor } = useTheme({
+  diagramType: computed(() => diagramStore.type),
+})
+
+// Language for export messages
+const { isZh } = useLanguage()
+
+// Export composable
+function getExportTitle(): string {
+  const topicText = diagramStore.getTopicNodeText()
+  if (topicText) return topicText
+  return diagramStore.effectiveTitle || getDefaultDiagramName(diagramStore.type, isZh.value)
+}
+
+function getExportSpec(): Record<string, unknown> | null {
+  return diagramStore.getSpecForSave()
+}
+
+const { exportByFormat } = useDiagramExport({
+  getContainer: () => vueFlowWrapper.value,
+  getDiagramSpec: getExportSpec,
+  getTitle: getExportTitle,
+  isZh: () => isZh.value,
+})
+
+// Vue Flow instance
+const {
+  onNodesChange,
+  onNodeClick,
+  onNodeDoubleClick,
+  onNodeDragStop,
+  fitView,
+  getNodes,
+  setViewport,
+  getViewport,
+  zoomIn,
+  zoomOut,
+  screenToFlowCoordinate,
+} = useVueFlow()
+
+// Vue Flow wrapper reference for context menu
+const vueFlowWrapper = ref<HTMLElement | null>(null)
+
+// Track if current fit was done with panel space reserved
+const isFittedForPanel = ref(false)
+
+// Track if we've done initial fit for current diagram - prevents fitView on pane click
+// (nodes-initialized can re-fire when vueFlowNodes returns new refs on selection clear)
+const hasInitialFitDoneForDiagram = ref(false)
+
+// Reset initial-fit flag when diagram changes (new load, type switch)
+watch(
+  () => [diagramStore.type, diagramStore.data] as const,
+  () => {
+    hasInitialFitDoneForDiagram.value = false
+  }
+)
+
+// Canvas container reference for size calculations
+const canvasContainer = ref<HTMLElement | null>(null)
+
+// Context menu state
+const contextMenuVisible = ref(false)
+const contextMenuX = ref(0)
+const contextMenuY = ref(0)
+const contextMenuNode = ref<MindGraphNode | null>(null)
+const contextMenuTarget = ref<'node' | 'pane'>('pane')
+
+// Custom node types registration
+// Use markRaw to prevent Vue from making components reactive (performance optimization)
+const nodeTypes = {
+  topic: markRaw(TopicNode),
+  bubble: markRaw(BubbleNode),
+  branch: markRaw(BranchNode),
+  flow: markRaw(FlowNode),
+  flowSubstep: markRaw(FlowSubstepNode), // Substep nodes for flow maps
+  brace: markRaw(BraceNode),
+  boundary: markRaw(BoundaryNode),
+  label: markRaw(LabelNode),
+  circle: markRaw(CircleNode), // Perfect circular nodes for circle maps
+  // Default fallbacks
+  tree: markRaw(BranchNode),
+  bridge: markRaw(BranchNode),
+}
+
+// Custom edge types registration
+// Use markRaw to prevent Vue from making components reactive (performance optimization)
+const edgeTypes = {
+  curved: markRaw(CurvedEdge),
+  straight: markRaw(StraightEdge),
+  step: markRaw(StepEdge), // T/L shaped orthogonal connectors for tree maps
+  horizontalStep: markRaw(HorizontalStepEdge), // Horizontal-first T/L for flow map substeps
+  tree: markRaw(TreeEdge), // Straight vertical lines for tree maps (no arrowhead)
+  radial: markRaw(RadialEdge), // Center-to-center for radial layouts (bubble maps)
+  brace: markRaw(BraceEdge),
+  bridge: markRaw(StraightEdge), // Use straight for bridge maps
+}
+
+// Computed nodes and edges from store
+const nodes = computed(() => diagramStore.vueFlowNodes)
+// For brace maps, hide individual edges since BraceOverlay draws the braces
+const edges = computed(() => {
+  if (diagramStore.type === 'brace_map') {
+    // Hide edges for brace maps - the BraceOverlay component draws them
+    return []
+  }
+  return diagramStore.vueFlowEdges
+})
+
+// Handle node changes (position updates, etc.)
+onNodesChange((changes) => {
+  changes.forEach((change) => {
+    if (change.type === 'position' && change.position) {
+      // During drag, update position but don't mark as custom yet
+      diagramStore.updateNodePosition(change.id, change.position, false)
+    }
+  })
+})
+
+// Helper function to get timestamp for logging
+function getTimestamp(): string {
+  return new Date().toISOString()
+}
+
+// Handle node click
+onNodeClick(({ node, event }) => {
+  console.log(`[DiagramCanvas] [${getTimestamp()}] ========== NODE CLICKED ==========`)
+  console.log(`[DiagramCanvas] [${getTimestamp()}] Node clicked:`, {
+    nodeId: node.id,
+    nodeType: node.type,
+    diagramType: node.data?.diagramType,
+    pairIndex: node.data?.pairIndex,
+    position: node.data?.position,
+    text: node.data?.label || node.data?.text,
+    nodePosition: node.position,
+    clickEvent: {
+      type: event?.type,
+      button: (event as MouseEvent)?.button,
+      clientX: (event as MouseEvent)?.clientX,
+      clientY: (event as MouseEvent)?.clientY,
+    },
+  })
+  console.log(`[DiagramCanvas] [${getTimestamp()}] Currently selected nodes:`, [...diagramStore.selectedNodes])
+  diagramStore.selectNodes(node.id)
+  console.log(`[DiagramCanvas] [${getTimestamp()}] After selection, selected nodes:`, [...diagramStore.selectedNodes])
+  console.log(`[DiagramCanvas] [${getTimestamp()}] ====================================`)
+  emit('nodeClick', node as unknown as MindGraphNode)
+})
+
+// Handle node double-click for editing
+onNodeDoubleClick(({ node }) => {
+  emit('nodeDoubleClick', node as unknown as MindGraphNode)
+})
+
+// Handle node drag stop - mark position as custom (user-dragged)
+onNodeDragStop(({ node }) => {
+  // Save as custom position since user dragged it
+  diagramStore.saveCustomPosition(node.id, node.position.x, node.position.y)
+  diagramStore.pushHistory('Move node')
+  emit('nodeDragStop', node as unknown as MindGraphNode)
+})
+
+// Handle pane click (deselect)
+function handlePaneClick() {
+  diagramStore.clearSelection()
+  emit('paneClick')
+}
+
+// Handle pane context menu (right-click on empty canvas)
+function handlePaneContextMenu(event: MouseEvent) {
+  event.preventDefault()
+  contextMenuX.value = event.clientX
+  contextMenuY.value = event.clientY
+  contextMenuNode.value = null
+  contextMenuTarget.value = 'pane'
+  contextMenuVisible.value = true
+}
+
+// Handle node context menu (right-click on node)
+function handleNodeContextMenu(event: MouseEvent, node: MindGraphNode) {
+  event.preventDefault()
+  contextMenuX.value = event.clientX
+  contextMenuY.value = event.clientY
+  contextMenuNode.value = node
+  contextMenuTarget.value = 'node'
+  contextMenuVisible.value = true
+}
+
+// Context menu setup - stored for cleanup on unmount
+let contextMenuSetupTimeoutId: ReturnType<typeof setTimeout> | null = null
+let contextMenuElement: HTMLElement | null = null
+let contextMenuHandler: ((event: Event) => void) | null = null
+
+function handleContextMenuEvent(event: Event) {
+  const mouseEvent = event as MouseEvent
+  const target = mouseEvent.target as HTMLElement
+
+  const nodeElement = target.closest('.vue-flow__node')
+  if (nodeElement) {
+    const nodeId = nodeElement.getAttribute('data-id')
+    if (nodeId) {
+      const node = getNodes.value.find((n) => n.id === nodeId)
+      if (node) {
+        handleNodeContextMenu(mouseEvent, node as unknown as MindGraphNode)
+        return
+      }
+    }
+  }
+
+  handlePaneContextMenu(mouseEvent)
+}
+
+// Set up context menu listeners on mount
+onMounted(() => {
+  contextMenuSetupTimeoutId = setTimeout(() => {
+    contextMenuSetupTimeoutId = null
+    const vueFlowElement = vueFlowWrapper.value?.querySelector('.vue-flow') as HTMLElement | null
+    if (vueFlowElement) {
+      contextMenuElement = vueFlowElement
+      contextMenuHandler = handleContextMenuEvent
+      vueFlowElement.addEventListener('contextmenu', contextMenuHandler)
+    }
+  }, 100)
+})
+
+// Close context menu
+function closeContextMenu() {
+  contextMenuVisible.value = false
+  contextMenuNode.value = null
+}
+
+// Handle paste from context menu - convert screen coords to flow coords
+function handleContextMenuPaste(position: { x: number; y: number }) {
+  const flowPos = screenToFlowCoordinate({ x: position.x, y: position.y })
+  diagramStore.pasteNodesAt(flowPos)
+}
+
+// Handle nodes initialized - Vue Flow has placed nodes, viewport is ready
+// Use same flow as zoom fit button; delay to let layout fully settle
+// Only fit on first init for current diagram - nodes-initialized re-fires when
+// vueFlowNodes returns new refs (e.g. on pane click/selection clear), which would
+// otherwise trigger unwanted fitView and the "re-compute" feeling
+function handleNodesInitialized() {
+  if (!props.fitViewOnInit || getNodes.value.length === 0) return
+  if (hasInitialFitDoneForDiagram.value) return
+  hasInitialFitDoneForDiagram.value = true
+  // Radial diagrams (circle/bubble/double_bubble): 100ms delay so diagram fits soon and size is visible
+  const delay =
+    diagramStore.type === 'double_bubble_map' ||
+    diagramStore.type === 'circle_map' ||
+    diagramStore.type === 'bubble_map'
+      ? ANIMATION.FIT_DELAY
+      : ANIMATION.FIT_VIEWPORT_DELAY
+  setTimeout(() => {
+    eventBus.emit('view:fit_to_canvas_requested', { animate: true })
+  }, delay)
+}
+
+// ============================================================================
+// Two-View Zoom System
+// ============================================================================
+
+/**
+ * Get the width of currently open right-side panels
+ */
+function getRightPanelWidth(): number {
+  let width = 0
+  if (panelsStore.propertyPanel.isOpen) {
+    width = PANEL.PROPERTY_WIDTH
+  } else if (panelsStore.mindmatePanel.isOpen) {
+    width = PANEL.MINDMATE_WIDTH
+  }
+  return width
+}
+
+/**
+ * Get the width of currently open left-side panels
+ */
+function getLeftPanelWidth(): number {
+  if (panelsStore.nodePalettePanel.isOpen) {
+    return PANEL.NODE_PALETTE_WIDTH
+  }
+  return 0
+}
+
+/**
+ * Check if any panel is currently visible
+ */
+function isAnyPanelOpen(): boolean {
+  return panelsStore.anyPanelOpen
+}
+
+/**
+ * Emit zoom_changed when viewport changes (scroll zoom, fit, etc.) for ZoomControls sync
+ */
+function handleViewportChange(viewport: { x: number; y: number; zoom: number }): void {
+  eventBus.emit('view:zoom_changed', {
+    zoom: viewport.zoom,
+    zoomPercent: Math.round(viewport.zoom * 100),
+  })
+}
+
+/** Get circle map layout from current store nodes (same as recalculateCircleMapLayout). */
+function getCircleMapLayout(): CircleMapLayoutResult | null {
+  if (diagramStore.type !== 'circle_map' || !diagramStore.data?.nodes) return null
+  const nodes = diagramStore.data.nodes
+  const topicNode = nodes.find(
+    (n: { type: string }) => n.type === 'topic' || n.type === 'center'
+  )
+  const contextNodes = nodes
+    .filter(
+      (n: { type: string; id: string }) =>
+        n.type === 'bubble' && n.id.startsWith('context-')
+    )
+    .sort((a: { id: string }, b: { id: string }) => {
+      const i = parseInt(a.id.replace(/^context-/, ''), 10)
+      const j = parseInt(b.id.replace(/^context-/, ''), 10)
+      return i - j
+    })
+  const topicText = (topicNode as { text?: string } | undefined)?.text ?? ''
+  const contextTexts = contextNodes.map((n: { text: string }) => n.text)
+  return calculateCircleMapLayout(contextNodes.length, contextTexts, topicText)
+}
+
+/** Bubble map bounds from recalculated layout: fixed center + radius so all nodes fit. */
+function getBubbleMapBounds(): { centerX: number; centerY: number; radius: number } | null {
+  if (diagramStore.type !== 'bubble_map' || !diagramStore.data?.nodes?.length) return null
+  const layoutNodes = recalculateBubbleMapLayout(diagramStore.data.nodes)
+  if (!layoutNodes.length) return null
+  let minX = Infinity
+  let minY = Infinity
+  let maxX = -Infinity
+  let maxY = -Infinity
+  for (const n of layoutNodes) {
+    const size = (n.style?.size as number | undefined) ?? 60
+    const x = n.position?.x ?? 0
+    const y = n.position?.y ?? 0
+    minX = Math.min(minX, x)
+    minY = Math.min(minY, y)
+    maxX = Math.max(maxX, x + size)
+    maxY = Math.max(maxY, y + size)
+  }
+  const centerX = DEFAULT_CENTER_X
+  const centerY = DEFAULT_CENTER_Y
+  const radius = Math.max(
+    centerX - minX,
+    maxX - centerX,
+    centerY - minY,
+    maxY - centerY,
+    1
+  )
+  return { centerX, centerY, radius }
+}
+
+/** Double bubble map bounds from current nodes (positions + size/width/height). */
+function getDoubleBubbleMapBounds(): { centerX: number; centerY: number; radius: number } | null {
+  if (diagramStore.type !== 'double_bubble_map' || !diagramStore.data?.nodes?.length) return null
+  const nodes = diagramStore.data.nodes
+  let minX = Infinity
+  let minY = Infinity
+  let maxX = -Infinity
+  let maxY = -Infinity
+  for (const n of nodes) {
+    const x = n.position?.x ?? 0
+    const y = n.position?.y ?? 0
+    const w = (n.style?.width as number | undefined) ?? (n.style?.size as number | undefined) ?? 60
+    const h = (n.style?.height as number | undefined) ?? (n.style?.size as number | undefined) ?? 60
+    minX = Math.min(minX, x)
+    minY = Math.min(minY, y)
+    maxX = Math.max(maxX, x + w)
+    maxY = Math.max(maxY, y + h)
+  }
+  const centerX = (minX + maxX) / 2
+  const centerY = (minY + maxY) / 2
+  const radius = Math.max(
+    maxX - centerX,
+    centerX - minX,
+    maxY - centerY,
+    centerY - minY,
+    1
+  )
+  return { centerX, centerY, radius }
+}
+
+/**
+ * Fit a radial diagram (circle_map or bubble_map) so the given circle is fully visible and centered.
+ */
+function fitRadialToView(
+  animate: boolean,
+  options: {
+    containerWidth: number
+    containerHeight: number
+    paddingPx?: number
+    topPx?: number
+    bottomPx?: number
+  },
+  centerX: number,
+  centerY: number,
+  outerRadius: number
+): void {
+  const pad = options.paddingPx ?? FIT_PADDING.STANDARD_PX
+  const top =
+    options.topPx ??
+    (parseInt(String(FIT_PADDING.STANDARD_WITH_BOTTOM_UI.top), 10) || 108)
+  const bottom =
+    options.bottomPx ??
+    (parseInt(String(FIT_PADDING.STANDARD_WITH_BOTTOM_UI.bottom), 10) || 100)
+  const boundsSize = 2 * (outerRadius + pad)
+  const contentWidth = options.containerWidth - 2 * pad
+  const contentHeight = options.containerHeight - top - bottom
+  const zoom = Math.min(
+    contentWidth / boundsSize,
+    contentHeight / boundsSize,
+    ZOOM.MAX
+  )
+  const clampedZoom = Math.max(ZOOM.MIN, zoom)
+  const viewportX = options.containerWidth / 2 - centerX * clampedZoom
+  const viewportY = top + contentHeight / 2 - centerY * clampedZoom
+  setViewport(
+    { x: viewportX, y: viewportY, zoom: clampedZoom },
+    { duration: animate ? ANIMATION.DURATION_NORMAL : 0 }
+  )
+}
+
+/** Fit circle map so the outer boundary circle is fully visible and centered. */
+function fitCircleMapToView(
+  animate: boolean,
+  options: {
+    containerWidth: number
+    containerHeight: number
+    paddingPx?: number
+    topPx?: number
+    bottomPx?: number
+  }
+): void {
+  const layout = getCircleMapLayout()
+  if (!layout) return
+  fitRadialToView(
+    animate,
+    options,
+    layout.centerX,
+    layout.centerY,
+    layout.outerCircleR
+  )
+}
+
+/** Fit bubble map so all nodes are visible and diagram center stays at viewport center. */
+function fitBubbleMapToView(
+  animate: boolean,
+  options: {
+    containerWidth: number
+    containerHeight: number
+    paddingPx?: number
+    topPx?: number
+    bottomPx?: number
+  }
+): void {
+  const bounds = getBubbleMapBounds()
+  if (!bounds) return
+  fitRadialToView(
+    animate,
+    options,
+    bounds.centerX,
+    bounds.centerY,
+    bounds.radius
+  )
+}
+
+/** Fit double bubble map so all nodes are visible and centered. */
+function fitDoubleBubbleMapToView(
+  animate: boolean,
+  options: {
+    containerWidth: number
+    containerHeight: number
+    paddingPx?: number
+    topPx?: number
+    bottomPx?: number
+  }
+): void {
+  const bounds = getDoubleBubbleMapBounds()
+  if (!bounds) return
+  // For double_bubble_map we now prefer Vue Flow's native fitView via
+  // fitToFullCanvas / fitWithPanel, so this helper is kept for completeness
+  // but no longer used as the primary fit path.
+  fitRadialToView(
+    animate,
+    options,
+    bounds.centerX,
+    bounds.centerY,
+    bounds.radius
+  )
+}
+
+/**
+ * Fit diagram to full canvas (no panel space reserved)
+ * Use when no panels are open or when you want the diagram centered on full screen
+ * For circle_map, fits using outer boundary circle so the full diagram is visible.
+ */
+function fitToFullCanvas(animate = true): void {
+  if (getNodes.value.length === 0) return
+
+  isFittedForPanel.value = false
+
+  const container = canvasContainer.value
+  if (container) {
+    if (diagramStore.type === 'circle_map') {
+      fitCircleMapToView(animate, {
+        containerWidth: container.clientWidth,
+        containerHeight: container.clientHeight,
+      })
+      eventBus.emit('view:fit_completed', { mode: 'full_canvas', animate })
+      return
+    }
+    if (diagramStore.type === 'bubble_map') {
+      fitBubbleMapToView(animate, {
+        containerWidth: container.clientWidth,
+        containerHeight: container.clientHeight,
+      })
+      eventBus.emit('view:fit_completed', { mode: 'full_canvas', animate })
+      return
+    }
+  }
+
+  // Use Vue Flow's fitView with extra bottom padding for ZoomControls + AIModelSelector
+  fitView({
+    padding: FIT_PADDING.STANDARD_WITH_BOTTOM_UI,
+    duration: animate ? ANIMATION.DURATION_NORMAL : 0,
+  })
+
+  eventBus.emit('view:fit_completed', {
+    mode: 'full_canvas',
+    animate,
+  })
+}
+
+/**
+ * Fit diagram with panel space reserved
+ * Calculates available canvas area excluding panel widths
+ */
+function fitWithPanel(animate = true): void {
+  if (getNodes.value.length === 0) return
+
+  const rightPanelWidth = getRightPanelWidth()
+  const leftPanelWidth = getLeftPanelWidth()
+  const totalPanelWidth = rightPanelWidth + leftPanelWidth
+
+  if (totalPanelWidth === 0) {
+    // No panels open, use full canvas fit
+    fitToFullCanvas(animate)
+    return
+  }
+
+  isFittedForPanel.value = true
+
+  // Get container dimensions
+  const container = canvasContainer.value
+  if (!container) {
+    // Fallback to standard fitView if container not available
+    fitView({
+      padding: FIT_PADDING.STANDARD_WITH_BOTTOM_UI,
+      duration: animate ? ANIMATION.DURATION_NORMAL : 0,
+    })
+    return
+  }
+
+  const containerWidth = container.clientWidth
+  const containerHeight = container.clientHeight
+
+  const basePadding = FIT_PADDING.STANDARD
+  const panelPaddingRatio = totalPanelWidth / containerWidth
+  const adjustedPadding = basePadding + panelPaddingRatio * 0.3
+  const paddingPx = Math.round(containerWidth * adjustedPadding)
+  const panelFitOptions = {
+    containerWidth,
+    containerHeight,
+    paddingPx,
+    topPx: FIT_PADDING.TOP_UI_HEIGHT_PX,
+    bottomPx: Math.round(
+      containerHeight * (basePadding + FIT_PADDING.BOTTOM_UI_EXTRA)
+    ),
+  }
+
+  if (diagramStore.type === 'circle_map') {
+    fitCircleMapToView(animate, panelFitOptions)
+    const delay = animate ? ANIMATION.FIT_VIEWPORT_DELAY : ANIMATION.PANEL_DELAY
+    setTimeout(() => {
+      const currentViewport = getViewport()
+      const rightOffset = rightPanelWidth / 2
+      const leftOffset = leftPanelWidth / 2
+      const netOffset = leftOffset - rightOffset
+      setViewport(
+        {
+          x: currentViewport.x + netOffset,
+          y: currentViewport.y,
+          zoom: currentViewport.zoom,
+        },
+        { duration: animate ? ANIMATION.DURATION_FAST : 0 }
+      )
+    }, delay)
+    eventBus.emit('view:fit_completed', {
+      mode: 'with_panel',
+      animate,
+      panelWidth: totalPanelWidth,
+    })
+    return
+  }
+
+  if (diagramStore.type === 'bubble_map') {
+    fitBubbleMapToView(animate, panelFitOptions)
+    const delay = animate ? ANIMATION.FIT_VIEWPORT_DELAY : ANIMATION.PANEL_DELAY
+    setTimeout(() => {
+      const currentViewport = getViewport()
+      const rightOffset = rightPanelWidth / 2
+      const leftOffset = leftPanelWidth / 2
+      const netOffset = leftOffset - rightOffset
+      setViewport(
+        {
+          x: currentViewport.x + netOffset,
+          y: currentViewport.y,
+          zoom: currentViewport.zoom,
+        },
+        { duration: animate ? ANIMATION.DURATION_FAST : 0 }
+      )
+    }, delay)
+    eventBus.emit('view:fit_completed', {
+      mode: 'with_panel',
+      animate,
+      panelWidth: totalPanelWidth,
+    })
+    return
+  }
+
+  // Use fitView with adjusted padding and extra bottom for ZoomControls + AIModelSelector
+  fitView({
+    padding: {
+      top: `${FIT_PADDING.TOP_UI_HEIGHT_PX}px`,
+      right: adjustedPadding,
+      bottom: basePadding + FIT_PADDING.BOTTOM_UI_EXTRA,
+      left: adjustedPadding,
+    },
+    duration: animate ? ANIMATION.DURATION_NORMAL : 0,
+  })
+
+  // After fitView, adjust the viewport to account for panel offset
+  const delay = animate ? ANIMATION.FIT_VIEWPORT_DELAY : ANIMATION.PANEL_DELAY
+  setTimeout(() => {
+    const currentViewport = getViewport()
+    const rightOffset = rightPanelWidth / 2
+    const leftOffset = leftPanelWidth / 2
+    const netOffset = leftOffset - rightOffset
+    setViewport(
+      {
+        x: currentViewport.x + netOffset,
+        y: currentViewport.y,
+        zoom: currentViewport.zoom,
+      },
+      { duration: animate ? ANIMATION.DURATION_FAST : 0 }
+    )
+  }, delay)
+
+  eventBus.emit('view:fit_completed', {
+    mode: 'with_panel',
+    animate,
+    panelWidth: totalPanelWidth,
+  })
+}
+
+/**
+ * Smart fit based on current panel visibility
+ * Automatically chooses full canvas or panel-aware fit
+ */
+function fitDiagram(animate = true): void {
+  if (isAnyPanelOpen()) {
+    fitWithPanel(animate)
+  } else {
+    fitToFullCanvas(animate)
+  }
+}
+
+/**
+ * Fit diagram for export (no animation, minimal padding)
+ */
+function fitForExport(): void {
+  fitView({
+    padding: FIT_PADDING.EXPORT,
+    duration: 0,
+  })
+}
+
+// ============================================================================
+// Watchers and Event Handlers
+// ============================================================================
+
+// Fit view when nodes are added/removed; double_bubble_map from 0 to N must fit (doc: 100ms)
+watch(
+  () => nodes.value.length,
+  (newLength, oldLength) => {
+    if (!props.fitViewOnInit || newLength === 0) return
+    // When double_bubble_map goes from 0 to >0, always fit so diagram is not tiny
+    if (
+      diagramStore.type === 'double_bubble_map' &&
+      newLength > 0 &&
+      (oldLength === 0 || oldLength === undefined)
+    ) {
+      setTimeout(() => {
+        eventBus.emit('view:fit_to_canvas_requested', { animate: true })
+      }, ANIMATION.FIT_DELAY)
+      return
+    }
+    if (oldLength === undefined) return
+    setTimeout(() => {
+      eventBus.emit('view:fit_to_canvas_requested', { animate: true })
+    }, ANIMATION.FIT_DELAY)
+  }
+)
+
+// Watch panel state changes and re-fit diagram
+watch(
+  () => panelsStore.anyPanelOpen,
+  (isOpen, wasOpen) => {
+    // Only re-fit if we have nodes and panel state actually changed
+    if (nodes.value.length > 0 && isOpen !== wasOpen) {
+      // Delay to allow panel animation to start
+      setTimeout(() => fitDiagram(true), ANIMATION.PANEL_DELAY)
+    }
+  }
+)
+
+// Watch individual panel changes for more responsive fitting
+watch(
+  () => [
+    panelsStore.mindmatePanel.isOpen,
+    panelsStore.propertyPanel.isOpen,
+    panelsStore.nodePalettePanel.isOpen,
+  ],
+  () => {
+    // Re-fit when any panel opens/closes
+    if (nodes.value.length > 0) {
+      setTimeout(() => fitDiagram(true), ANIMATION.PANEL_DELAY)
+    }
+  }
+)
+
+// ============================================================================
+// EventBus Subscriptions
+// ============================================================================
+
+// Unsubscribe functions for cleanup
+const unsubscribers: (() => void)[] = []
+
+onMounted(() => {
+  // Listen for node edit requests from context menu
+  unsubscribers.push(
+    eventBus.on('node:edit_requested', ({ nodeId }) => {
+      const node = getNodes.value.find((n) => n.id === nodeId)
+      if (node) {
+        emit('nodeDoubleClick', node as unknown as MindGraphNode)
+      }
+    })
+  )
+
+  // Listen for fit requests from other components
+  unsubscribers.push(
+    eventBus.on('view:fit_to_window_requested', (data) => {
+      const animate = data?.animate !== false
+      fitToFullCanvas(animate)
+    })
+  )
+
+  unsubscribers.push(
+    eventBus.on('view:fit_to_canvas_requested', (data) => {
+      const animate = data?.animate !== false
+      fitWithPanel(animate)
+    })
+  )
+
+  unsubscribers.push(
+    eventBus.on('view:fit_diagram_requested', () => {
+      fitDiagram(true)
+    })
+  )
+
+  unsubscribers.push(
+    eventBus.on('view:fit_for_export_requested', () => {
+      fitForExport()
+    })
+  )
+
+  unsubscribers.push(
+    eventBus.on('toolbar:export_requested', async ({ format }) => {
+      const savedViewport = getViewport()
+      fitForExport()
+      await nextTick()
+      await exportByFormat(format)
+      setViewport(savedViewport, { duration: ANIMATION.DURATION_FAST })
+    })
+  )
+
+  unsubscribers.push(
+    eventBus.on('view:zoom_in_requested', () => {
+      zoomIn()
+    })
+  )
+
+  unsubscribers.push(
+    eventBus.on('view:zoom_out_requested', () => {
+      zoomOut()
+    })
+  )
+
+  unsubscribers.push(
+    eventBus.on('view:zoom_set_requested', ({ zoom }) => {
+      const vp = getViewport()
+      setViewport({ x: vp.x, y: vp.y, zoom }, { duration: ANIMATION.DURATION_FAST })
+    })
+  )
+
+  // Listen for inline text updates from node components
+  unsubscribers.push(
+    eventBus.on('node:text_updated', ({ nodeId, text }) => {
+      diagramStore.pushHistory('Edit node text')
+      diagramStore.updateNode(nodeId, { text })
+      // Circle map: after context/topic text change, layout grows; refit so full diagram stays visible
+      if (diagramStore.type === 'circle_map') {
+        setTimeout(
+          () => fitDiagram(true),
+          ANIMATION.CIRCLE_MAP_FIT_DELAY
+        )
+      }
+      // Bubble map: after attribute/topic text change, layout grows; refit so diagram stays centered and fully visible
+      if (diagramStore.type === 'bubble_map') {
+        setTimeout(
+          () => fitDiagram(true),
+          ANIMATION.BUBBLE_MAP_FIT_DELAY
+        )
+      }
+      // Double bubble map: rebuild spec from nodes (new text), reload layout, then fit
+      if (diagramStore.type === 'double_bubble_map') {
+        const spec = diagramStore.getDoubleBubbleSpecFromData()
+        if (spec) {
+          diagramStore.loadFromSpec(spec, 'double_bubble_map')
+          setTimeout(
+            () => fitDiagram(true),
+            ANIMATION.DOUBLE_BUBBLE_MAP_FIT_DELAY
+          )
+        }
+      }
+    })
+  )
+
+  // Listen for topic node width changes in multi-flow maps
+  // When topic node becomes wider, store the width and trigger layout recalculation
+  unsubscribers.push(
+    eventBus.on('multi_flow_map:topic_width_changed', ({ nodeId, width }) => {
+      if (diagramStore.type !== 'multi_flow_map' || nodeId !== 'event' || width === null) {
+        return
+      }
+
+      // Store the topic node width in the diagram store
+      // This will trigger the vueFlowNodes computed to recalculate with the new width
+      diagramStore.setTopicNodeWidth(width)
+    })
+  )
+
+  // Listen for node width changes in multi-flow maps
+  // Store widths for visual balance calculation
+  unsubscribers.push(
+    eventBus.on('multi_flow_map:node_width_changed', ({ nodeId, width }) => {
+      if (diagramStore.type !== 'multi_flow_map' || !nodeId || width === null) {
+        return
+      }
+
+      // Store the node width for visual balance
+      diagramStore.setNodeWidth(nodeId, width)
+    })
+  )
+})
+
+onUnmounted(() => {
+  // Clear context menu setup timeout if still pending
+  if (contextMenuSetupTimeoutId) {
+    clearTimeout(contextMenuSetupTimeoutId)
+    contextMenuSetupTimeoutId = null
+  }
+  // Remove context menu listener
+  if (contextMenuElement && contextMenuHandler) {
+    contextMenuElement.removeEventListener('contextmenu', contextMenuHandler)
+    contextMenuElement = null
+    contextMenuHandler = null
+  }
+  // Clean up all subscriptions
+  unsubscribers.forEach((unsub) => unsub())
+  unsubscribers.length = 0
+})
+
+// Expose methods for parent components
+defineExpose({
+  fitToFullCanvas,
+  fitWithPanel,
+  fitDiagram,
+  fitForExport,
+  isFittedForPanel,
+})
+
+// ============================================================================
+// Template Constants (expose config values for template use)
+// ============================================================================
+
+const zoomConfig = {
+  min: ZOOM.MIN,
+  max: ZOOM.MAX,
+  default: ZOOM.DEFAULT,
+}
+
+const gridConfig = {
+  snapSize: [...GRID.SNAP_SIZE] as [number, number],
+  backgroundGap: GRID.BACKGROUND_GAP,
+  backgroundDotSize: GRID.BACKGROUND_DOT_SIZE,
+}
+</script>
+
+<template>
+  <div
+    ref="canvasContainer"
+    class="diagram-canvas w-full h-full"
+  >
+    <div
+      ref="vueFlowWrapper"
+      class="vue-flow-wrapper w-full h-full"
+      :class="{ 'wireframe-mode': uiStore.wireframeMode }"
+    >
+      <VueFlow
+      :nodes="nodes"
+      :edges="edges"
+      :node-types="nodeTypes"
+      :edge-types="edgeTypes"
+      :default-viewport="{ x: 0, y: 0, zoom: zoomConfig.default }"
+      :min-zoom="zoomConfig.min"
+      :max-zoom="zoomConfig.max"
+      :snap-to-grid="true"
+      :snap-grid="gridConfig.snapSize"
+      :nodes-draggable="!props.handToolActive"
+      :nodes-connectable="false"
+      :elements-selectable="!props.handToolActive"
+      :pan-on-scroll="false"
+      :zoom-on-scroll="true"
+      :pan-on-drag="props.handToolActive ? [0, 1, 2] : [1, 2]"
+      :class="[
+        'bg-gray-50 dark:bg-gray-900',
+        diagramStore.type !== null &&
+        ['circle_map', 'bubble_map', 'double_bubble_map'].includes(diagramStore.type)
+          ? 'circle-map-canvas'
+          : '',
+      ]"
+      :style="{ backgroundColor: backgroundColor }"
+      @pane-click="handlePaneClick"
+      @nodes-initialized="handleNodesInitialized"
+      @viewport-change="handleViewportChange"
+    >
+      <!-- Background pattern -->
+      <Background
+        v-if="showBackground"
+        :gap="gridConfig.backgroundGap"
+        :size="gridConfig.backgroundDotSize"
+        pattern-color="#e5e7eb"
+      />
+
+      <!-- Minimap for overview -->
+      <MiniMap
+        v-if="showMinimap"
+        position="bottom-left"
+        :pannable="true"
+        :zoomable="true"
+      />
+
+      <!-- Brace overlay for brace maps (draws unified curly braces) -->
+      <BraceOverlay />
+
+      <!-- Bridge overlay for bridge maps (draws vertical lines, triangles, and dimension label) -->
+      <BridgeOverlay />
+      </VueFlow>
+    </div>
+
+    <!-- Custom context menu -->
+    <ContextMenu
+      :visible="contextMenuVisible"
+      :x="contextMenuX"
+      :y="contextMenuY"
+      :node="contextMenuNode"
+      :target="contextMenuTarget"
+      @close="closeContextMenu"
+      @paste="handleContextMenuPaste"
+    />
+  </div>
+</template>
+
+<style>
+/* Vue Flow base styles */
+@import '@vue-flow/core/dist/style.css';
+@import '@vue-flow/core/dist/theme-default.css';
+@import '@vue-flow/minimap/dist/style.css';
+
+.diagram-canvas {
+  position: relative;
+}
+
+.vue-flow-wrapper {
+  transition: filter 0.2s ease;
+}
+
+.vue-flow-wrapper.wireframe-mode {
+  filter: grayscale(1);
+}
+
+/* Default node selection styles (box-shadow for rectangular nodes) */
+.vue-flow__node.selected {
+  box-shadow: 0 0 0 2px #3b82f6;
+}
+
+/* Circle map & bubble maps: hide Vue Flow's selection bounding box, use per-node pulse animation instead */
+.circle-map-canvas .vue-flow__nodesselection,
+.circle-map-canvas .vue-flow__nodesselection-rect {
+  display: none !important;
+}
+
+/* Bubble map attribute nodes (pill shape): pulse glow when selected, same as circle map */
+.circle-map-canvas .vue-flow__node-bubble.selected {
+  box-shadow: none !important;
+  animation: pulseGlow 2s ease-in-out infinite;
+}
+
+/* Circle nodes: circular wrapper so any outline follows circle shape; pulse animation when selected */
+.vue-flow__node-circle {
+  border-radius: 50% !important;
+  overflow: visible;
+}
+
+/* ============================================
+   CIRCLE NODE SELECTION ANIMATION OPTIONS
+   ============================================
+   Uncomment ONE of the options below to use it.
+   Each option provides a different visual style for selected circle nodes.
+   ============================================ */
+
+/* OPTION 1: Pulsing Glow (Animated) - Smooth pulsing effect */
+/* Creates a breathing/pulsing animation that draws attention */
+@keyframes pulseGlow {
+  0%, 100% {
+    filter: drop-shadow(0 0 8px rgba(102, 126, 234, 0.6))
+      drop-shadow(0 0 4px rgba(102, 126, 234, 0.4));
+  }
+  50% {
+    filter: drop-shadow(0 0 16px rgba(102, 126, 234, 0.9))
+      drop-shadow(0 0 8px rgba(102, 126, 234, 0.7));
+  }
+}
+.vue-flow__node-circle.selected {
+  box-shadow: none !important;
+  animation: pulseGlow 2s ease-in-out infinite;
+}
+
+/* OPTION 2: Clean Ring Border - Minimalist approach */
+/* Simple, clean ring that doesn't distract from content */
+/*
+.vue-flow__node-circle.selected {
+  box-shadow: none !important;
+  filter: drop-shadow(0 0 0 3px rgba(102, 126, 234, 0.8))
+    drop-shadow(0 0 0 1px rgba(102, 126, 234, 0.4));
+}
+*/
+
+/* OPTION 3: Scale + Glow - Subtle size increase with glow */
+/* Node slightly grows and glows when selected */
+/*
+.vue-flow__node-circle.selected {
+  box-shadow: none !important;
+  filter: drop-shadow(0 0 12px rgba(102, 126, 234, 0.8))
+    drop-shadow(0 0 4px rgba(102, 126, 234, 0.6));
+  transform: scale(1.05);
+}
+*/
+
+/* OPTION 4: Gradient Border Glow - Animated gradient ring */
+/* Creates a rotating gradient effect around the border */
+/*
+@keyframes gradientRotate {
+  0% {
+    filter: drop-shadow(0 0 12px rgba(102, 126, 234, 0.8))
+      drop-shadow(0 0 4px rgba(147, 51, 234, 0.6));
+  }
+  50% {
+    filter: drop-shadow(0 0 12px rgba(147, 51, 234, 0.8))
+      drop-shadow(0 0 4px rgba(102, 126, 234, 0.6));
+  }
+  100% {
+    filter: drop-shadow(0 0 12px rgba(102, 126, 234, 0.8))
+      drop-shadow(0 0 4px rgba(147, 51, 234, 0.6));
+  }
+}
+.vue-flow__node-circle.selected {
+  box-shadow: none !important;
+  animation: gradientRotate 3s ease-in-out infinite;
+}
+*/
+
+/* OPTION 5: Expanding Shadow - Growing shadow effect */
+/* Shadow expands outward creating depth */
+/*
+@keyframes expandShadow {
+  0% {
+    filter: drop-shadow(0 0 4px rgba(102, 126, 234, 0.6));
+  }
+  100% {
+    filter: drop-shadow(0 0 20px rgba(102, 126, 234, 0.9))
+      drop-shadow(0 0 10px rgba(102, 126, 234, 0.7));
+  }
+}
+.vue-flow__node-circle.selected {
+  box-shadow: none !important;
+  animation: expandShadow 1.5s ease-out forwards;
+}
+*/
+
+/* OPTION 6: Color Shift + Glow - Subtle color change */
+/* Node color shifts slightly warmer with glow */
+/*
+.vue-flow__node-circle.selected {
+  box-shadow: none !important;
+  filter: drop-shadow(0 0 12px rgba(102, 126, 234, 0.8))
+    drop-shadow(0 0 4px rgba(102, 126, 234, 0.6))
+    brightness(1.1) saturate(1.1);
+}
+*/
+
+/* OPTION 7: Ripple Effect - Concentric expanding circles */
+/* Creates a ripple animation effect */
+/*
+@keyframes ripple {
+  0% {
+    filter: drop-shadow(0 0 0 rgba(102, 126, 234, 0));
+  }
+  50% {
+    filter: drop-shadow(0 0 8px rgba(102, 126, 234, 0.6))
+      drop-shadow(0 0 16px rgba(102, 126, 234, 0.3));
+  }
+  100% {
+    filter: drop-shadow(0 0 16px rgba(102, 126, 234, 0.4))
+      drop-shadow(0 0 24px rgba(102, 126, 234, 0.2));
+  }
+}
+.vue-flow__node-circle.selected {
+  box-shadow: none !important;
+  animation: ripple 2s ease-out infinite;
+}
+*/
+
+/* OPTION 8: Golden Accent - Warm golden glow */
+/* Elegant golden/yellow accent instead of blue */
+/*
+.vue-flow__node-circle.selected {
+  box-shadow: none !important;
+  filter: drop-shadow(0 0 12px rgba(234, 179, 8, 0.8))
+    drop-shadow(0 0 4px rgba(234, 179, 8, 0.6));
+}
+*/
+
+/* OPTION 9: Dual Ring - Two concentric rings */
+/* Clean double-ring effect for emphasis */
+/*
+.vue-flow__node-circle.selected {
+  box-shadow: none !important;
+  filter: drop-shadow(0 0 0 4px rgba(102, 126, 234, 0.3))
+    drop-shadow(0 0 0 2px rgba(102, 126, 234, 0.8))
+    drop-shadow(0 0 8px rgba(102, 126, 234, 0.6));
+}
+*/
+
+/* OPTION 10: Subtle Pulse - Very gentle pulsing */
+/* Minimal animation, less distracting */
+/*
+@keyframes subtlePulse {
+  0%, 100% {
+    filter: drop-shadow(0 0 10px rgba(102, 126, 234, 0.7));
+  }
+  50% {
+    filter: drop-shadow(0 0 14px rgba(102, 126, 234, 0.8));
+  }
+}
+.vue-flow__node-circle.selected {
+  box-shadow: none !important;
+  animation: subtlePulse 3s ease-in-out infinite;
+}
+*/
+
+/* OPTION 11: Original Blue Glow (Current) - Static blue glow */
+/* The original implementation - no animation */
+/*
+.vue-flow__node-circle.selected {
+  box-shadow: none !important;
+  filter: drop-shadow(0 0 12px rgba(102, 126, 234, 0.8))
+    drop-shadow(0 0 4px rgba(102, 126, 234, 0.6));
+}
+*/
+
+/* Smooth transitions */
+.vue-flow__node {
+  transition:
+    box-shadow 0.2s ease,
+    filter 0.2s ease,
+    transform 0.2s ease;
+}
+
+/* Boundary node styling - ensure it's visible and not clipped */
+.vue-flow__node-boundary {
+  overflow: visible !important;
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  z-index: -1 !important;
+}
+
+/* Ensure boundary node doesn't interfere with other nodes */
+.vue-flow__node-boundary:hover {
+  box-shadow: none !important;
+}
+
+/* Boundary nodes should never show selection */
+.vue-flow__node-boundary.selected {
+  box-shadow: none !important;
+  filter: none !important;
+}
+
+/* Multi-flow map node selection - matches circle map approach */
+/* Use :has() selector to target wrapper when it contains multi-flow-map-node component */
+/* This is the SAME approach as circle map - target by node type classes */
+.vue-flow__node-flow.selected:has(.multi-flow-map-node),
+.vue-flow__node-topic.selected:has(.multi-flow-map-node) {
+  box-shadow: none !important;
+  filter: drop-shadow(0 0 8px rgba(102, 126, 234, 0.6))
+    drop-shadow(0 0 4px rgba(102, 126, 234, 0.4)) !important;
+  animation: pulseGlow 2s ease-in-out infinite !important;
+}
+
+/* Fallback: Target by ID patterns if :has() not supported (older browsers) */
+.vue-flow__node-flow[id^="cause-"].selected,
+.vue-flow__node-flow[id^="effect-"].selected,
+.vue-flow__node-topic[id="event"].selected {
+  border: 2px solid var(--primary-color, #3b82f6);
+}
+
+/* Workshop editing indicators */
+.vue-flow__node.workshop-editing {
+  position: relative;
+  border: 3px solid var(--editor-color, #FF6B6B) !important;
+  box-shadow: 0 0 8px rgba(255, 107, 107, 0.4);
+  animation: workshop-pulse 2s ease-in-out infinite;
+}
+
+.vue-flow__node.workshop-editing::before {
+  content: attr(data-editor-emoji);
+  position: absolute;
+  top: -12px;
+  right: -12px;
+  width: 24px;
+  height: 24px;
+  background: var(--editor-color, #FF6B6B);
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  z-index: 1000;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+  border: 2px solid white;
+}
+
+.vue-flow__node.workshop-editing::after {
+  content: attr(data-editor-username) ' ' attr(data-editor-emoji) ' editing';
+  position: absolute;
+  top: -40px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--editor-color, #FF6B6B);
+  color: white;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  white-space: nowrap;
+  z-index: 1000;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+
+.vue-flow__node.workshop-editing:hover::after {
+  opacity: 1;
+}
+
+@keyframes workshop-pulse {
+  0%, 100% {
+    box-shadow: 0 0 8px rgba(255, 107, 107, 0.4);
+  }
+  50% {
+    box-shadow: 0 0 16px rgba(255, 107, 107, 0.6);
+  }
+}
+
+/* Workshop editing indicators */
+.vue-flow__node.workshop-editing {
+  position: relative;
+  border: 3px solid var(--editor-color, #FF6B6B) !important;
+  box-shadow: 0 0 8px rgba(255, 107, 107, 0.4);
+  animation: workshop-pulse 2s ease-in-out infinite;
+}
+
+.vue-flow__node.workshop-editing::before {
+  content: attr(data-editor-emoji);
+  position: absolute;
+  top: -12px;
+  right: -12px;
+  width: 24px;
+  height: 24px;
+  background: var(--editor-color, #FF6B6B);
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  z-index: 1000;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+  border: 2px solid white;
+}
+
+.vue-flow__node.workshop-editing::after {
+  content: attr(data-editor-username) ' ' attr(data-editor-emoji) ' editing';
+  position: absolute;
+  top: -40px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--editor-color, #FF6B6B);
+  color: white;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  white-space: nowrap;
+  z-index: 1000;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+
+.vue-flow__node.workshop-editing:hover::after {
+  opacity: 1;
+}
+
+@keyframes workshop-pulse {
+  0%, 100% {
+    box-shadow: 0 0 8px rgba(255, 107, 107, 0.4);
+  }
+  50% {
+    box-shadow: 0 0 16px rgba(255, 107, 107, 0.6);
+  }
+}
+
+.vue-flow__node-flow[id^="cause-"].selected,
+.vue-flow__node-flow[id^="effect-"].selected,
+.vue-flow__node-topic[id="event"].selected {
+  box-shadow: none !important;
+  filter: drop-shadow(0 0 8px rgba(102, 126, 234, 0.6))
+    drop-shadow(0 0 4px rgba(102, 126, 234, 0.4)) !important;
+  animation: pulseGlow 2s ease-in-out infinite !important;
+}
+</style>

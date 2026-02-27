@@ -1,0 +1,267 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+# Python distribution folder (not Vue frontend/dist)
+/dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Application specific
+test_output.jpg
+*.log
+*.tmp
+*.temp
+temp/
+tmp/
+temp_images/
+logs/*.log
+*.pid
+logs/*.pid
+
+# Runtime data directory (captcha storage, database files)
+data/
+captcha_store.json
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+# SQLite WAL mode files (created automatically)
+*.db-wal
+*.db-shm
+*.sqlite-wal
+*.sqlite-shm
+
+# Database backups
+backup/
+backups/
+*.backup_*
+*_backup_*.sql
+*.db.*
+mindgraph.db.*
+*.sqlite.*
+*.sqlite3.*
+
+# Environment file backups
+logs/env_backups/
+.env.backup.*
+.env.*.backup
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Docker (removed - will be added back later)
+# .dockerignore
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# API Keys and sensitive data
+*API_KEY*.txt
+*API_KEY*.json
+*_key.txt
+api_keys/
+keys/
+
+# Development temporary files
+development_prompts/*.md
+extracted_prompts/
+
+# Test outputs
+tests/images/
+tests/results/
+tests/specs/
+tests/html_viewer/
+test/images/
+test/results/
+test/specs/
+test/html_viewer/
+
+# Coverage reports
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pyenv
+.python-version
+
+# pipenv
+Pipfile.lock
+
+# PEP 582
+__pypackages__/
+
+# Celery
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# Large binary files
+*.zip
+*.tar.gz
+*.rar
+*.7z
+*.iso
+*.pdf
+
+# Prototype folder
+prototype/
+
+# Browser binaries (offline Chromium installer)
+# Ignore entire browsers folder (transfer via personal methods, keep GitHub small)
+browsers/
+
+# Vue Frontend Build (v5.0.0+)
+# Ignore entire dist folder - build on server during deployment
+frontend/dist/
+
+# Runtime static files (announcement images, etc.)
+# These are user uploads, not part of the codebase
+static/
+
+# Library storage directory
+# These are user uploads, images, PDFs, and other library content, not part of the codebase
+storage/library/
+
+# Documentation
+docs/
+# ruff
+.ruff_cache/
+
+# Tiktoken encoding cache (downloaded files, ~1.6MB)
+storage/tiktoken_cache/
+
+# RAG test datasets
+services/knowledge/rag_chunk_test/rag-test/
+
+# ESP32 Firmware
+# Build outputs
+esp32/firmware/build/
+esp32/firmware/**/build/
+
+# ESP-IDF configuration backups
+esp32/firmware/sdkconfig.old
+esp32/firmware/sdkconfig.h
+
+# Compiled binaries and images
+esp32/firmware/**/*.bin
+esp32/firmware/**/*.elf
+esp32/firmware/**/*.map
+
+# SPIFFS images (can be regenerated)
+esp32/firmware/main/fonts/fonts.bin
+esp32/firmware/main/fonts/*.bin
+
+# Backup directories
+esp32/firmware/main/fonts/backup_*/
+esp32/firmware/**/backup_*/
+
+# Generated files (can be regenerated)
+esp32/firmware/compile_commands.json
+esp32/firmware/dependencies.lock
+
+# IDE files for ESP32
+esp32/.vscode/
+esp32/.idea/
+esp32/.clangd
+
+# ESP32 cache and temporary files
+esp32/firmware/.cache/
+esp32/firmware/**/.cache/
+
+# ESP32 reference folders (brookesia - for reference only)
+esp32/brookesia-esp/
+esp32/brookesia-waveshare/
+
+# ESP32 assets (if generated, uncomment if needed)
+# esp32/firmware/assets/
+
+# Font files (binary fonts should not be tracked)
+*.ttf
+*.otf
+*.woff
+*.woff2
+*.eot
+*.fnt
+esp32/fonts/
+esp32/firmware/**/fonts/*.ttf
+esp32/firmware/**/fonts/*.otf
+esp32/firmware/**/fonts/*.woff
+esp32/firmware/**/fonts/*.woff2
+esp32/firmware/**/fonts/*.eot
+esp32/firmware/**/fonts/*.fnt
