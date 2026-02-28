@@ -422,9 +422,19 @@ function handleAddNode() {
       notify.warning(isZh.value ? '不可添加主题词节点' : 'Cannot add topic nodes')
       return
     }
+    // Sync diagram type and language so useDiagramOperations uses correct ops and default text
+    operations.setDiagramType('double_bubble_map')
+    operations.setLanguage(isZh.value ? 'zh' : 'en')
     const spec = diagramStore.getDoubleBubbleSpecFromData()
     const ops = operations.operations?.value
-    if (!spec || !ops) return
+    if (!spec) {
+      notify.warning(isZh.value ? '无法获取当前图示数据' : 'Cannot get diagram data')
+      return
+    }
+    if (!ops) {
+      notify.warning(isZh.value ? '当前图示类型不支持添加节点' : 'Add node not supported for this diagram')
+      return
+    }
     const result = ops.addNode(spec, undefined, selId)
     if (result) {
       diagramStore.loadFromSpec(spec, 'double_bubble_map')
@@ -720,9 +730,18 @@ async function handleDeleteNode() {
         nodesToDelete.add(id)
       }
     }
+    // Sync diagram type so useDiagramOperations has correct operations (in case event was missed)
+    operations.setDiagramType('double_bubble_map')
     const spec = diagramStore.getDoubleBubbleSpecFromData()
     const ops = operations.operations?.value
-    if (!spec || !ops) return
+    if (!spec) {
+      notify.warning(isZh.value ? '无法获取当前图示数据' : 'Cannot get diagram data')
+      return
+    }
+    if (!ops) {
+      notify.warning(isZh.value ? '当前图示类型不支持删除节点' : 'Delete nodes not supported for this diagram')
+      return
+    }
     const result = ops.deleteNodes(spec, Array.from(nodesToDelete))
     if (result && result.deletedIds.length > 0) {
       diagramStore.loadFromSpec(spec, 'double_bubble_map')

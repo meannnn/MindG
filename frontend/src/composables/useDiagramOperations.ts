@@ -851,6 +851,17 @@ export function useDiagramOperations(options: UseDiagramOperationsOptions = {}) 
 
   function setDiagramType(type: DiagramType): void {
     diagramType.value = type
+    // Sync operations immediately so callers (e.g. toolbar add node) get ops in same tick
+    const effective = effectiveType.value
+    if (effective) {
+      operations.value = createOperations()
+      eventBus.emit('diagram:operations_loaded', {
+        diagramType: effective,
+        available: !!operations.value,
+      })
+    } else {
+      operations.value = null
+    }
   }
 
   function setLanguage(lang: string): void {
